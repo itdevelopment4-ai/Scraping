@@ -1,0 +1,42 @@
+{
+  "chunk_id": "cb-2.2.1.0-whats-new",
+  "version": "2.2.1.0",
+  "series": "2.2.x",
+  "release_date": "2024-06",
+  "doc_type": "release_note",
+  "category": "whats_new",
+  "source_url": "https://support.ptc.com/help/codebeamer/r2.2/en/codebeamer/release_notes/whats_new_in_codebeamer_2_2_1_0.html",
+  "title": "What’s New in Codebeamer 2.2.1.0",
+  "sections": [
+    {
+      "section_id": "schema-preparation",
+      "title": "Module for Schema Preparation",
+      "category": "migration_constraint",
+      "content": "If you plan to upgrade to Codebeamer 3.0.0.0, you must first run the migration module in Codebeamer 2.2.1.0. This step is mandatory and prepares the entire database schema for the 3.0 migration. It also enables upcoming performance enhancements, primarily affecting Working-Set creation."
+    },
+    {
+      "section_id": "deprecations",
+      "title": "Features Marked for Deprecation",
+      "category": "deprecation",
+      "content": "The tracker-related feature 'Propagate Unresolved Item Dependencies' is deprecated and will be removed in Codebeamer 3.0.0."
+    },
+    {
+      "section_id": "content-virus-scanner",
+      "title": "Content Virus Scanner",
+      "category": "feature",
+      "content": "An example implementation of a content virus scanner using the FileUploadListener API and ClamAV antivirus has been documented."
+    },
+    {
+      "section_id": "helpcenter-config",
+      "title": "Help Center Application Configuration",
+      "category": "configuration",
+      "content": "A new 'helpCenter' application configuration option allows modification of Help Link URLs when deploying an offline Help Center on a custom web server."
+    },
+    {
+      "section_id": "widget-lazy-loading",
+      "title": "Widget Lazy Loading",
+      "category": "feature",
+      "content": "Users and administrators can disable automatic loading of widget content on dashboards, either per user or globally."
+    }
+  ]
+}
