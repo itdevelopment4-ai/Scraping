@@ -6,7 +6,7 @@ Searches DuckDuckGo for movie/film production + sound companies,
 extracts a company name + website, and saves to CSV.
 
 This script is designed to run overnight and stop once it reaches
-TARGET_COUNT companies (default: 500).
+TARGET_COUNT companies (default: 1000).
 """
 
 import csv
@@ -14,6 +14,8 @@ import logging
 import os
 import random
 import re
+import socket
+import ssl
 import time
 from html.parser import HTMLParser
 from urllib.parse import parse_qs, quote_plus, unquote, urljoin, urlparse
@@ -28,13 +30,17 @@ from urllib.error import HTTPError, URLError
 OUTPUT_FILE = "movie_production_companies.csv"
 LOG_FILE = "movie_company_search.log"
 
-TARGET_COUNT = 500
-MAX_PAGES = 10
-SLEEP_MIN = 1.5
-SLEEP_MAX = 3.5
+TARGET_COUNT = 1000
+MAX_PAGES = 12
+SLEEP_MIN = 1.8
+SLEEP_MAX = 3.8
 
 REQUEST_TIMEOUT = 25
 MAX_RESPONSE_BYTES = 2_000_000  # 2 MB
+MAX_RETRIES = 4
+BACKOFF_BASE = 1.6
+BACKOFF_MAX = 20
+RETRY_STATUS_CODES = {429, 500, 502, 503, 504}
 
 COUNTRIES = [
     "USA", "UK", "India", "Canada", "Australia",
@@ -59,6 +65,10 @@ BASE_QUERIES = [
     "film and video production company",
     "movie production service company",
     "film production agency",
+    "documentary production company",
+    "documentary film production company",
+    "documentary production studio",
+    "documentary film studio",
     "movie sound production company",
     "film sound production company",
     "movie sound studio",
@@ -68,6 +78,11 @@ BASE_QUERIES = [
     "movie post production company",
     "audio post production for film",
     "post production studio",
+    "visual effects studio",
+    "vfx studio",
+    "animation studio",
+    "film post production studio",
+    "audio post production studio",
 ]
 
 BLOCKED_DOMAINS = [
@@ -83,16 +98,42 @@ BLOCKED_DOMAINS = [
     "tiktok.com",
     "reddit.com",
     "pinterest.com",
+    "justdial.com",
+    "sulekha.com",
+    "grotal.com",
+    "indiamart.com",
+    "clutch.co",
+    "designrush.com",
+    "goodfirms.co",
+    "sortlist.com",
+    "upcity.com",
+    "themanifest.com",
+    "agencyspotter.com",
+    "yelp.com",
+    "yellowpages.com",
+    "manta.com",
+    "cylex.com",
+    "kompass.com",
+    "dnb.com",
+    "hoovers.com",
+    "owler.com",
+    "zoominfo.com",
+    "crunchbase.com",
+    "pitchbook.com",
+    "opencorporates.com",
+    "productionhub.com",
+    "backstage.com",
+    "staffmeup.com",
+    "mandy.com",
+    "behance.net",
+    "vimeo.com",
+    "vitrina.ai",
     "indeed.com",
     "glassdoor.com",
     "ziprecruiter.com",
     "monster.com",
     "simplyhired.com",
     "careerbuilder.com",
-    "crunchbase.com",
-    "pitchbook.com",
-    "zoominfo.com",
-    "opencorporates.com",
 ]
 
 USER_AGENTS = [
@@ -102,6 +143,114 @@ USER_AGENTS = [
     "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 "
     "(KHTML, like Gecko) Version/17.0 Safari/605.1.15",
+]
+
+TITLE_BLOCK_PATTERNS = [
+    re.compile(r"\btop\s+\d+\b", re.I),
+    re.compile(r"\bbest\b.*\b(companies|agencies|studios)\b", re.I),
+    re.compile(r"\blist of\b", re.I),
+    re.compile(r"\b(companies|studios|agencies)\s+in\b", re.I),
+    re.compile(r"\bproduction\s+companies\b", re.I),
+    re.compile(r"\bvideo\s+production\s+companies\b", re.I),
+    re.compile(r"\bfilm\s+production\s+companies\b", re.I),
+    re.compile(r"\bdirectory\b", re.I),
+    re.compile(r"\breviews?\b", re.I),
+    re.compile(r"\bratings?\b", re.I),
+    re.compile(r"\bnear me\b", re.I),
+    re.compile(r"\bjobs?\b", re.I),
+    re.compile(r"\bcareers?\b", re.I),
+    re.compile(r"\bacademy\b|\bschool\b|\bcollege\b|\btraining\b", re.I),
+    re.compile(r"\bblog\b|\bnews\b|\barticle\b", re.I),
+]
+
+URL_BLOCK_RE = re.compile(
+    r"/(top|best|list|directory|reviews?|ratings?|rank|companies-in|"
+    r"production-companies|video-production-companies|film-production-companies|"
+    r"blog|news|article|jobs?|careers?|academy|course|training|school|pricing|"
+    r"cost|quote|compare)",
+    re.I,
+)
+
+COMPANY_SIGNAL_KEYWORDS = [
+    "studio",
+    "studios",
+    "production",
+    "films",
+    "film",
+    "movie",
+    "movies",
+    "pictures",
+    "media",
+    "entertainment",
+    "documentary",
+    "post-production",
+    "post production",
+    "sound",
+    "audio",
+    "vfx",
+    "visual effects",
+    "animation",
+    "cinema",
+]
+
+CONTACT_SIGNAL_KEYWORDS = [
+    "contact",
+    "about",
+    "our team",
+    "team",
+    "services",
+    "projects",
+    "our work",
+    "clients",
+]
+
+HARD_NEGATIVE_PAGE_KEYWORDS = [
+    "list of",
+    "companies in",
+    "directory",
+    "top ",
+    "best ",
+    "reviews",
+    "ratings",
+    "compare",
+    "comparison",
+    "near me",
+]
+
+SOFT_NEGATIVE_PAGE_KEYWORDS = [
+    "jobs",
+    "careers",
+    "open positions",
+    "academy",
+    "course",
+    "school",
+    "college",
+    "training",
+    "blog",
+    "news",
+    "article",
+    "digital marketing",
+    "seo",
+]
+
+GENERIC_NAME_PATTERNS = [
+    re.compile(r"\btop\b", re.I),
+    re.compile(r"\bbest\b", re.I),
+    re.compile(r"\blist\b", re.I),
+    re.compile(r"\bcompanies\b", re.I),
+    re.compile(r"\bproduction\s+companies\b", re.I),
+    re.compile(r"\bvideo\s+production\s+companies\b", re.I),
+    re.compile(r"\bfilm\s+production\s+companies\b", re.I),
+    re.compile(r"\bproduction\s+houses\b", re.I),
+    re.compile(r"\bjobs?\b", re.I),
+    re.compile(r"\bcareers?\b", re.I),
+    re.compile(r"\bnear me\b", re.I),
+    re.compile(r"\bdirectory\b", re.I),
+    re.compile(r"\breviews?\b", re.I),
+    re.compile(r"\bratings?\b", re.I),
+    re.compile(r"\bmarketing\b", re.I),
+    re.compile(r"\bagency\b", re.I),
+    re.compile(r"\bacademy\b|\bschool\b|\bcollege\b", re.I),
 ]
 
 
@@ -224,23 +373,67 @@ def normalize_duckduckgo_url(href):
     return None
 
 
+def backoff_seconds(attempt):
+    jitter = random.uniform(0, 0.6)
+    return min(BACKOFF_MAX, BACKOFF_BASE * (2 ** attempt) + jitter)
+
+
 def fetch_url(url):
-    headers = {
-        "User-Agent": random.choice(USER_AGENTS),
-        "Accept-Language": "en-US,en;q=0.9",
-    }
-    req = Request(url, headers=headers)
-    try:
-        with urlopen(req, timeout=REQUEST_TIMEOUT) as resp:
-            content_type = resp.headers.get("Content-Type", "")
-            charset = "utf-8"
-            if "charset=" in content_type:
-                charset = content_type.split("charset=")[-1].split(";")[0].strip()
-            raw = resp.read(MAX_RESPONSE_BYTES)
-            return raw.decode(charset, errors="replace")
-    except (HTTPError, URLError, ValueError) as exc:
-        logger.warning("Fetch failed: %s | %s", url, exc)
-        return None
+    last_exc = None
+    for attempt in range(MAX_RETRIES):
+        headers = {
+            "User-Agent": random.choice(USER_AGENTS),
+            "Accept-Language": "en-US,en;q=0.9",
+        }
+        req = Request(url, headers=headers)
+        try:
+            with urlopen(req, timeout=REQUEST_TIMEOUT) as resp:
+                status = getattr(resp, "status", None)
+                if status in RETRY_STATUS_CODES:
+                    raise HTTPError(url, status, "Retryable status", resp.headers, None)
+
+                content_type = resp.headers.get("Content-Type", "")
+                if content_type and "text/html" not in content_type:
+                    if "application/xhtml+xml" not in content_type:
+                        logger.info("Skipping non-HTML content: %s | %s", url, content_type)
+                        return None
+
+                charset = "utf-8"
+                if "charset=" in content_type:
+                    charset = content_type.split("charset=")[-1].split(";")[0].strip()
+                raw = resp.read(MAX_RESPONSE_BYTES)
+                return raw.decode(charset, errors="replace")
+        except HTTPError as exc:
+            status = getattr(exc, "code", None)
+            if status in RETRY_STATUS_CODES:
+                last_exc = exc
+                wait = backoff_seconds(attempt)
+                logger.warning("HTTP %s for %s. Retrying in %.1fs", status, url, wait)
+                time.sleep(wait)
+                continue
+            logger.warning("Fetch failed: %s | HTTP %s", url, status)
+            return None
+        except (
+            URLError,
+            ConnectionResetError,
+            TimeoutError,
+            socket.timeout,
+            ssl.SSLError,
+            OSError,
+            ValueError,
+        ) as exc:
+            last_exc = exc
+            if attempt < MAX_RETRIES - 1:
+                wait = backoff_seconds(attempt)
+                logger.warning("Fetch failed: %s | %s. Retrying in %.1fs", url, exc, wait)
+                time.sleep(wait)
+                continue
+            logger.warning("Fetch failed: %s | %s", url, exc)
+            return None
+
+    if last_exc:
+        logger.warning("Fetch gave up: %s | %s", url, last_exc)
+    return None
 
 
 def parse_duckduckgo_results(html):
@@ -257,6 +450,56 @@ def parse_duckduckgo_results(html):
             continue
         results.append((title, url))
     return results
+
+
+def is_list_or_directory_title(title):
+    title = title or ""
+    for pattern in TITLE_BLOCK_PATTERNS:
+        if pattern.search(title):
+            return True
+    return False
+
+
+def is_bad_url_path(url):
+    parsed = urlparse(url)
+    path = (parsed.path or "").lower()
+    query = (parsed.query or "").lower()
+    return bool(URL_BLOCK_RE.search(path) or URL_BLOCK_RE.search(query))
+
+
+def page_looks_like_company(html):
+    html_lower = html.lower()
+    if any(key in html_lower for key in HARD_NEGATIVE_PAGE_KEYWORDS):
+        return False
+
+    contact_hit = (
+        "mailto:" in html_lower
+        or "tel:" in html_lower
+        or any(key in html_lower for key in CONTACT_SIGNAL_KEYWORDS)
+    )
+    company_hits = sum(1 for key in COMPANY_SIGNAL_KEYWORDS if key in html_lower)
+
+    if contact_hit:
+        return True
+
+    if company_hits >= 2 and not any(key in html_lower for key in SOFT_NEGATIVE_PAGE_KEYWORDS):
+        return True
+
+    return False
+
+
+def is_generic_name(name):
+    if not name:
+        return True
+    if len(name) > 80:
+        return True
+    lowered = name.lower()
+    for pattern in GENERIC_NAME_PATTERNS:
+        if pattern.search(lowered):
+            return True
+    if " in " in lowered and "companies" in lowered:
+        return True
+    return False
 
 
 def is_blocked_domain(url):
@@ -391,6 +634,10 @@ def search_companies(writer, seen_domains):
                     break
                 if is_blocked_domain(url):
                     continue
+                if is_list_or_directory_title(title):
+                    continue
+                if is_bad_url_path(url):
+                    continue
 
                 domain = normalize_domain(url)
                 if not domain or domain in seen_domains:
@@ -400,9 +647,20 @@ def search_companies(writer, seen_domains):
                 if not website:
                     continue
 
-                page_html = fetch_url(url)
-                name = extract_company_name(page_html, title, domain)
-                if not name:
+                try:
+                    page_html = fetch_url(url)
+                    polite_sleep()
+                    if not page_html:
+                        continue
+
+                    if not page_looks_like_company(page_html):
+                        continue
+
+                    name = extract_company_name(page_html, title, domain)
+                    if not name or is_generic_name(name):
+                        continue
+                except Exception as exc:
+                    logger.warning("Skipping %s due to error: %s", url, exc)
                     continue
 
                 writer.writerow({
