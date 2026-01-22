@@ -13,6 +13,8 @@ import logging
 import os
 import random
 import re
+import socket
+import ssl
 import time
 from html.parser import HTMLParser
 from urllib.parse import parse_qs, quote_plus, unquote, urljoin, urlparse
@@ -34,6 +36,10 @@ SLEEP_MAX = 3.2
 
 REQUEST_TIMEOUT = 25
 MAX_RESPONSE_BYTES = 2_000_000  # 2 MB
+MAX_RETRIES = 4
+BACKOFF_BASE = 1.5
+BACKOFF_MAX = 20
+RETRY_STATUS_CODES = {429, 500, 502, 503, 504}
 
 USE_COUNTRIES = True
 COUNTRIES = [
@@ -375,23 +381,67 @@ def normalize_duckduckgo_url(href):
     return None
 
 
+def backoff_seconds(attempt):
+    jitter = random.uniform(0, 0.6)
+    return min(BACKOFF_MAX, BACKOFF_BASE * (2 ** attempt) + jitter)
+
+
 def fetch_url(url):
-    headers = {
-        "User-Agent": random.choice(USER_AGENTS),
-        "Accept-Language": "en-US,en;q=0.9",
-    }
-    req = Request(url, headers=headers)
-    try:
-        with urlopen(req, timeout=REQUEST_TIMEOUT) as resp:
-            content_type = resp.headers.get("Content-Type", "")
-            charset = "utf-8"
-            if "charset=" in content_type:
-                charset = content_type.split("charset=")[-1].split(";")[0].strip()
-            raw = resp.read(MAX_RESPONSE_BYTES)
-            return raw.decode(charset, errors="replace")
-    except (HTTPError, URLError, ValueError) as exc:
-        logger.warning("Fetch failed: %s | %s", url, exc)
-        return None
+    last_exc = None
+    for attempt in range(MAX_RETRIES):
+        headers = {
+            "User-Agent": random.choice(USER_AGENTS),
+            "Accept-Language": "en-US,en;q=0.9",
+        }
+        req = Request(url, headers=headers)
+        try:
+            with urlopen(req, timeout=REQUEST_TIMEOUT) as resp:
+                status = getattr(resp, "status", None)
+                if status in RETRY_STATUS_CODES:
+                    raise HTTPError(url, status, "Retryable status", resp.headers, None)
+
+                content_type = resp.headers.get("Content-Type", "")
+                if content_type and "text/html" not in content_type:
+                    if "application/xhtml+xml" not in content_type:
+                        logger.info("Skipping non-HTML content: %s | %s", url, content_type)
+                        return None
+
+                charset = "utf-8"
+                if "charset=" in content_type:
+                    charset = content_type.split("charset=")[-1].split(";")[0].strip()
+                raw = resp.read(MAX_RESPONSE_BYTES)
+                return raw.decode(charset, errors="replace")
+        except HTTPError as exc:
+            status = getattr(exc, "code", None)
+            if status in RETRY_STATUS_CODES:
+                last_exc = exc
+                wait = backoff_seconds(attempt)
+                logger.warning("HTTP %s for %s. Retrying in %.1fs", status, url, wait)
+                time.sleep(wait)
+                continue
+            logger.warning("Fetch failed: %s | HTTP %s", url, status)
+            return None
+        except (
+            URLError,
+            ConnectionResetError,
+            TimeoutError,
+            socket.timeout,
+            ssl.SSLError,
+            OSError,
+            ValueError,
+        ) as exc:
+            last_exc = exc
+            if attempt < MAX_RETRIES - 1:
+                wait = backoff_seconds(attempt)
+                logger.warning("Fetch failed: %s | %s. Retrying in %.1fs", url, exc, wait)
+                time.sleep(wait)
+                continue
+            logger.warning("Fetch failed: %s | %s", url, exc)
+            return None
+
+    if last_exc:
+        logger.warning("Fetch gave up: %s | %s", url, last_exc)
+    return None
 
 
 def parse_duckduckgo_results(html):
