@@ -213,6 +213,16 @@ HARD_NEGATIVE_PAGE_KEYWORDS = [
     "captcha",
     "cloudflare",
     "verify you are human",
+    "error 403",
+    "403 forbidden",
+    "error 404",
+    "404 not found",
+    "page not found",
+    "not found",
+    "service unavailable",
+    "temporarily unavailable",
+    "site can't be reached",
+    "this site can’t be reached",
 ]
 
 SOFT_NEGATIVE_PAGE_KEYWORDS = [
@@ -253,6 +263,8 @@ GENERIC_NAME_PATTERNS = [
     re.compile(r"\baccess denied\b", re.I),
     re.compile(r"\bforbidden\b", re.I),
     re.compile(r"\bjust a moment\b", re.I),
+    re.compile(r"\bnot found\b", re.I),
+    re.compile(r"\bservice unavailable\b", re.I),
 ]
 
 
@@ -581,6 +593,20 @@ def safe_page_source(driver):
     return ""
 
 
+def should_restart_on_exception(exc):
+    message = str(exc).lower()
+    restart_signals = [
+        "invalid session id",
+        "chrome not reachable",
+        "disconnected",
+        "no such window",
+        "session deleted",
+        "timed out receiving message from renderer",
+        "unable to receive message",
+    ]
+    return any(signal in message for signal in restart_signals)
+
+
 def restart_driver(driver):
     try:
         driver.quit()
@@ -596,16 +622,20 @@ def parse_search_results(driver):
         WebDriverWait(driver, 10).until(
             EC.presence_of_element_located((By.CSS_SELECTOR, "a.result__a"))
         )
-    except Exception:
+    except Exception as exc:
+        logger.warning("Search results not available: %s", exc)
         return results
 
-    for link in driver.find_elements(By.CSS_SELECTOR, "a.result__a"):
-        title = link.text.strip()
-        href = link.get_attribute("href")
-        url = normalize_duckduckgo_url(href)
-        if not url:
-            continue
-        results.append((title, url))
+    try:
+        for link in driver.find_elements(By.CSS_SELECTOR, "a.result__a"):
+            title = link.text.strip()
+            href = link.get_attribute("href")
+            url = normalize_duckduckgo_url(href)
+            if not url:
+                continue
+            results.append((title, url))
+    except Exception as exc:
+        logger.warning("Failed to parse search results: %s", exc)
     return results
 
 
@@ -629,14 +659,23 @@ def search_companies(driver, writer, output_handle, seen_domains):
                 + f"&s={offset}"
             )
             logger.info("Query: %s | page %d", term, page + 1)
-            if not safe_get(driver, search_url):
+            try:
+                if not safe_get(driver, search_url):
+                    failure_count += 1
+                    if failure_count >= RESTART_AFTER_FAILURES:
+                        logger.warning("Restarting Chrome after %d failures", failure_count)
+                        driver = restart_driver(driver)
+                        failure_count = 0
+                    continue
+                polite_sleep()
+            except Exception as exc:
+                logger.warning("Search page error: %s", exc)
                 failure_count += 1
-                if failure_count >= RESTART_AFTER_FAILURES:
-                    logger.warning("Restarting Chrome after %d failures", failure_count)
+                if should_restart_on_exception(exc) or failure_count >= RESTART_AFTER_FAILURES:
+                    logger.warning("Restarting Chrome after failures")
                     driver = restart_driver(driver)
                     failure_count = 0
                 continue
-            polite_sleep()
 
             results = parse_search_results(driver)
             if not results:
@@ -645,44 +684,53 @@ def search_companies(driver, writer, output_handle, seen_domains):
             for title, url in results:
                 if total >= TARGET_COUNT:
                     break
-                if is_blocked_domain(url):
-                    continue
-                if is_list_or_directory_title(title):
-                    continue
-                if is_bad_url_path(url):
-                    continue
+                try:
+                    if is_blocked_domain(url):
+                        continue
+                    if is_list_or_directory_title(title):
+                        continue
+                    if is_bad_url_path(url):
+                        continue
 
-                domain = normalize_domain(url)
-                if not domain or domain in seen_domains:
-                    continue
+                    domain = normalize_domain(url)
+                    if not domain or domain in seen_domains:
+                        continue
 
-                website = base_website(url)
-                if not website:
-                    continue
+                    website = base_website(url)
+                    if not website:
+                        continue
 
-                if not safe_get(driver, url):
+                    if not safe_get(driver, url):
+                        failure_count += 1
+                        if failure_count >= RESTART_AFTER_FAILURES:
+                            logger.warning("Restarting Chrome after %d failures", failure_count)
+                            driver = restart_driver(driver)
+                            failure_count = 0
+                        continue
+                    polite_sleep()
+
+                    page_html = safe_page_source(driver)
+                    if not page_html:
+                        failure_count += 1
+                        if failure_count >= RESTART_AFTER_FAILURES:
+                            logger.warning("Restarting Chrome after %d failures", failure_count)
+                            driver = restart_driver(driver)
+                            failure_count = 0
+                        continue
+
+                    if not page_looks_like_company(page_html):
+                        continue
+
+                    name = extract_company_name(page_html, title, domain)
+                    if not name or is_generic_name(name):
+                        continue
+                except Exception as exc:
+                    logger.warning("Skipping result due to error: %s", exc)
                     failure_count += 1
-                    if failure_count >= RESTART_AFTER_FAILURES:
-                        logger.warning("Restarting Chrome after %d failures", failure_count)
+                    if should_restart_on_exception(exc) or failure_count >= RESTART_AFTER_FAILURES:
+                        logger.warning("Restarting Chrome after failures")
                         driver = restart_driver(driver)
                         failure_count = 0
-                    continue
-                polite_sleep()
-
-                page_html = safe_page_source(driver)
-                if not page_html:
-                    failure_count += 1
-                    if failure_count >= RESTART_AFTER_FAILURES:
-                        logger.warning("Restarting Chrome after %d failures", failure_count)
-                        driver = restart_driver(driver)
-                        failure_count = 0
-                    continue
-
-                if not page_looks_like_company(page_html):
-                    continue
-
-                name = extract_company_name(page_html, title, domain)
-                if not name or is_generic_name(name):
                     continue
 
                 writer.writerow({
@@ -719,7 +767,14 @@ def main():
             if not file_exists:
                 writer.writeheader()
 
-            total, driver = search_companies(driver, writer, f, seen_domains)
+            while True:
+                try:
+                    total, driver = search_companies(driver, writer, f, seen_domains)
+                    break
+                except Exception as exc:
+                    logger.warning("Fatal error, restarting driver: %s", exc)
+                    driver = restart_driver(driver)
+                    time.sleep(3)
     finally:
         try:
             driver.quit()
