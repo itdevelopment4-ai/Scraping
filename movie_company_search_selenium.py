@@ -40,6 +40,7 @@ SLEEP_MIN = 1.8
 SLEEP_MAX = 3.8
 PAGE_LOAD_TIMEOUT = 25
 MAX_RETRIES = 3
+RESTART_AFTER_FAILURES = 5
 
 HEADLESS = False
 
@@ -207,6 +208,11 @@ HARD_NEGATIVE_PAGE_KEYWORDS = [
     "compare",
     "comparison",
     "near me",
+    "access denied",
+    "forbidden",
+    "captcha",
+    "cloudflare",
+    "verify you are human",
 ]
 
 SOFT_NEGATIVE_PAGE_KEYWORDS = [
@@ -243,6 +249,10 @@ GENERIC_NAME_PATTERNS = [
     re.compile(r"\bmarketing\b", re.I),
     re.compile(r"\bagency\b", re.I),
     re.compile(r"\bacademy\b|\bschool\b|\bcollege\b", re.I),
+    re.compile(r"\berror\b", re.I),
+    re.compile(r"\baccess denied\b", re.I),
+    re.compile(r"\bforbidden\b", re.I),
+    re.compile(r"\bjust a moment\b", re.I),
 ]
 
 
@@ -518,6 +528,7 @@ def build_driver():
     options = Options()
     if HEADLESS:
         options.add_argument("--headless=new")
+    options.page_load_strategy = "eager"
     options.add_argument("--start-maximized")
     options.add_argument("--disable-blink-features=AutomationControlled")
     options.add_argument("--no-sandbox")
@@ -549,6 +560,36 @@ def safe_get(driver, url):
     return False
 
 
+def safe_page_source(driver):
+    last_exc = None
+    for attempt in range(MAX_RETRIES):
+        try:
+            return driver.page_source or ""
+        except TimeoutException as exc:
+            last_exc = exc
+            logger.warning("Timeout getting page source (attempt %d)", attempt + 1)
+            try:
+                driver.execute_script("window.stop();")
+            except Exception:
+                pass
+        except WebDriverException as exc:
+            last_exc = exc
+            logger.warning("WebDriver error getting page source: %s", exc)
+        time.sleep(1 + attempt)
+
+    logger.warning("Failed to get page source: %s", last_exc)
+    return ""
+
+
+def restart_driver(driver):
+    try:
+        driver.quit()
+    except Exception:
+        pass
+    time.sleep(2)
+    return build_driver()
+
+
 def parse_search_results(driver):
     results = []
     try:
@@ -573,6 +614,7 @@ def search_companies(driver, writer, output_handle, seen_domains):
     terms = build_search_terms()
     logger.info("Loaded %d existing companies", total)
     logger.info("Searching %d queries", len(terms))
+    failure_count = 0
 
     for term in terms:
         if total >= TARGET_COUNT:
@@ -588,6 +630,11 @@ def search_companies(driver, writer, output_handle, seen_domains):
             )
             logger.info("Query: %s | page %d", term, page + 1)
             if not safe_get(driver, search_url):
+                failure_count += 1
+                if failure_count >= RESTART_AFTER_FAILURES:
+                    logger.warning("Restarting Chrome after %d failures", failure_count)
+                    driver = restart_driver(driver)
+                    failure_count = 0
                 continue
             polite_sleep()
 
@@ -614,11 +661,21 @@ def search_companies(driver, writer, output_handle, seen_domains):
                     continue
 
                 if not safe_get(driver, url):
+                    failure_count += 1
+                    if failure_count >= RESTART_AFTER_FAILURES:
+                        logger.warning("Restarting Chrome after %d failures", failure_count)
+                        driver = restart_driver(driver)
+                        failure_count = 0
                     continue
                 polite_sleep()
 
-                page_html = driver.page_source or ""
+                page_html = safe_page_source(driver)
                 if not page_html:
+                    failure_count += 1
+                    if failure_count >= RESTART_AFTER_FAILURES:
+                        logger.warning("Restarting Chrome after %d failures", failure_count)
+                        driver = restart_driver(driver)
+                        failure_count = 0
                     continue
 
                 if not page_looks_like_company(page_html):
@@ -639,10 +696,11 @@ def search_companies(driver, writer, output_handle, seen_domains):
 
                 seen_domains.add(domain)
                 total += 1
+                failure_count = 0
                 logger.info("Saved (%d/%d): %s | %s", total, TARGET_COUNT, name, website)
                 polite_sleep()
 
-    return total
+    return total, driver
 
 
 # ==========================
@@ -661,7 +719,7 @@ def main():
             if not file_exists:
                 writer.writeheader()
 
-            total = search_companies(driver, writer, f, seen_domains)
+            total, driver = search_companies(driver, writer, f, seen_domains)
     finally:
         try:
             driver.quit()
