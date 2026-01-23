@@ -568,7 +568,7 @@ def parse_search_results(driver):
     return results
 
 
-def search_companies(driver, writer, seen_domains):
+def search_companies(driver, writer, output_handle, seen_domains):
     total = len(seen_domains)
     terms = build_search_terms()
     logger.info("Loaded %d existing companies", total)
@@ -632,8 +632,10 @@ def search_companies(driver, writer, seen_domains):
                     "company_name": name,
                     "website": website,
                 })
-                writer_fh = writer.writerows.__self__
-                writer_fh.flush()
+                try:
+                    output_handle.flush()
+                except Exception:
+                    pass
 
                 seen_domains.add(domain)
                 total += 1
@@ -659,7 +661,7 @@ def main():
             if not file_exists:
                 writer.writeheader()
 
-            total = search_companies(driver, writer, seen_domains)
+            total = search_companies(driver, writer, f, seen_domains)
     finally:
         try:
             driver.quit()
